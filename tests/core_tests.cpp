@@ -551,6 +551,31 @@ void ParallelSearchConfiguration() {
     CHECK(actual.num_threads == expected.num_threads);
     CHECK(actual.batch_size == expected.batch_size);
     CHECK(actual.batch_timeout_us == expected.batch_timeout_us);
+    CHECK(actual.batch_source == BatchSource::kWorkers);
+  }
+
+  // The batch source round-trips, including the single-thread sources.
+  {
+    SearchOptions sequential;
+    sequential.parallel_mode = ParallelMode::kWuPuct;
+    sequential.batch_size = 16;
+    sequential.batch_source = BatchSource::kSequential;
+    SearchOptions direct;
+    direct.num_threads = 8;
+    direct.batch_source = BatchSource::kDirect;
+
+    Configuration config;
+    config.set_ai_options(AIPlayerId::kPlayer1, sequential);
+    config.set_ai_options(AIPlayerId::kPlayer2, direct);
+    config.Save();
+
+    Configuration loaded;
+    CHECK(loaded.ai_options(AIPlayerId::kPlayer1).batch_source ==
+          BatchSource::kSequential);
+    CHECK(loaded.ai_options(AIPlayerId::kPlayer1).batch_size == 16);
+    CHECK(loaded.ai_options(AIPlayerId::kPlayer2).batch_source ==
+          BatchSource::kDirect);
+    CHECK(loaded.ai_options(AIPlayerId::kPlayer2).num_threads == 8);
   }
 
   // Invalid or unknown values fall back to field defaults.

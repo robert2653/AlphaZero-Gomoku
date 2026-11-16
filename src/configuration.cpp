@@ -36,6 +36,7 @@ void ForEachSearchOption(Visitor&& visit) {
   visit("num_threads", &SearchOptions::num_threads);
   visit("batch_size", &SearchOptions::batch_size);
   visit("batch_timeout_us", &SearchOptions::batch_timeout_us);
+  visit("batch_source", &SearchOptions::batch_source);
 }
 
 template <typename Enum, size_t N>
@@ -54,6 +55,11 @@ std::optional<SearchLimit> ParseValue(const std::string& text, SearchLimit*) {
 std::optional<ParallelMode> ParseValue(const std::string& text,
                                        ParallelMode*) {
   return ParseEnum<ParallelMode>(text, kParallelModeNames);
+}
+
+std::optional<BatchSource> ParseValue(const std::string& text,
+                                      BatchSource*) {
+  return ParseEnum<BatchSource>(text, kBatchSourceNames);
 }
 
 std::optional<int> ParseValue(const std::string& text, int*) {
@@ -87,6 +93,10 @@ void WriteValue(std::ostream& out, SearchLimit value) {
 
 void WriteValue(std::ostream& out, ParallelMode value) {
   out << kParallelModeNames[static_cast<size_t>(value)];
+}
+
+void WriteValue(std::ostream& out, BatchSource value) {
+  out << kBatchSourceNames[static_cast<size_t>(value)];
 }
 
 // Parses a single AI search option, falling back to default on parse failure.
