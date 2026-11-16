@@ -3,3 +3,6 @@ logs/
 *.gom
 gomoku.cfg
 compile_commands.json
+build-opencl/
+model/alpha-zero.bin
+model/opencl-reference.bin

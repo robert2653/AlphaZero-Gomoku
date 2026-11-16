@@ -181,6 +181,22 @@ With one worker, no pre-update is visible during its own selection, so all three
 
 Settings shows `num_playouts` or `think_time_ms` for the selected search limit and `virtual_loss` only in Virtual Loss mode; hidden values are kept and saved. Each broken rule is listed under the settings, and saving is disabled until all are fixed. If the model fails during a search, the search tree is reset and the error is reported.
 
+### OpenCL Backend
+
+`OpenCLNetwork` (`include/opencl_network.h`) is a second `PolicyValueEvaluator` that runs the same network with hand-written OpenCL kernels (`kernels/policy_value_network.cl`) instead of LibTorch. It needs no LibTorch or CUDA toolkit at run time, only an OpenCL 1.2 driver, and is built separately from the main CMake project together with the MCTS core:
+
+```bash
+# 1. Export weights (BatchNorm folded into each convolution) and PyTorch reference outputs
+python tools/export_opencl_weights.py   # writes model/alpha-zero.bin and model/opencl-reference.bin
+# 2. Build (MSYS2 g++ on Windows uses the CUDA toolkit's CL headers and OpenCL.lib by default)
+bash scripts/build_opencl.sh            # set OPENCL_INCLUDE / OPENCL_LIB to override
+# 3. Check against PyTorch, then time the network and the parallel search
+./build-opencl/opencl_tests
+./build-opencl/opencl_bench [weights] [kernel] [playouts]
+```
+
+`opencl_tests` compares every policy probability and value with PyTorch (tolerance `1e-4`) at batch sizes 1, 7 and 64, checks that batched and single evaluation agree, and runs an 8-thread WU-PUCT search on the OpenCL network. Each kernel computes one output element per work-item; the activations are laid out as `[batch][channel][15×15]`, and the policy softmax runs on the CPU.
+
 ### Move Sampling
 
 Each AI samples moves with weights proportional to `visits^(1 / temperature)` after MCTS finishes for the first `num_sampling_moves` moves of a game. The defaults are `temperature = 1` and `num_sampling_moves = 30`. The move limit counts both players together: the first 30 board moves use sampling on AI turns, and move 31 onward selects the most visited move. Lower positive temperatures favor the most visited moves more strongly; higher temperatures spread the probabilities more evenly among visited moves.
