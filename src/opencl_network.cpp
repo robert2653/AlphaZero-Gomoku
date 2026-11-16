@@ -209,6 +209,16 @@ struct OpenCLNetwork::Impl {
     char name[256] = {};
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
     device_name = name;
+
+    // Conv3x3 runs one work-group per board, one work-item per cell.
+    size_t max_group = 0;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_group),
+                    &max_group, nullptr);
+    if (max_group < static_cast<size_t>(kPlane)) {
+      throw std::runtime_error("OpenCL device '" + device_name +
+                               "' cannot run work-groups of " +
+                               std::to_string(kPlane) + " work-items");
+    }
   }
 
   void BuildProgram(const std::string& kernel_path) {
@@ -376,8 +386,10 @@ struct OpenCLNetwork::Impl {
     const size_t global[3] = {
         kPlane, static_cast<size_t>(layer.out / kTileChannels),
         static_cast<size_t>((batch + tile_batch - 1) / tile_batch)};
-    Check(clEnqueueNDRangeKernel(queue, kernel, 3, nullptr, global, nullptr,
-                                 0, nullptr, nullptr),
+    // One work-group covers the whole board so it can share local memory.
+    const size_t local[3] = {kPlane, 1, 1};
+    Check(clEnqueueNDRangeKernel(queue, kernel, 3, nullptr, global, local, 0,
+                                 nullptr, nullptr),
           "clEnqueueNDRangeKernel(Conv3x3)");
   }
 

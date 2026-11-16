@@ -195,7 +195,7 @@ bash scripts/build_opencl.sh            # set OPENCL_INCLUDE / OPENCL_LIB to ove
 ./build-opencl/opencl_bench [weights] [kernel] [playouts]
 ```
 
-`opencl_tests` compares every policy probability and value with PyTorch (tolerance `1e-4`) at batch sizes 1, 7 and 64, checks that batched and single evaluation agree, and runs an 8-thread WU-PUCT search on the OpenCL network. Each kernel computes one output element per work-item; the activations are laid out as `[batch][channel][15×15]`, and the policy softmax runs on the CPU.
+`opencl_tests` compares every policy probability and value with PyTorch (tolerance `1e-4`) at batch sizes 1, 7 and 64, checks that batched and single evaluation agree, and runs an 8-thread WU-PUCT search on the OpenCL network. The 3×3 convolution runs one work-group per board (one work-item per cell): each round the group stages four zero-padded input channels and their weights in local memory, and each work-item accumulates 8 output channels for up to 8 positions in registers, picking the batch tile (1, 2, 4 or 8) the batch fills. The activations are laid out as `[batch][channel][15×15]`, and the policy softmax runs on the CPU.
 
 ### Move Sampling
 

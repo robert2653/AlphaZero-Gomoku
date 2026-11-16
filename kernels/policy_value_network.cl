@@ -11,10 +11,11 @@
 #define kActivationRelu 1
 #define kActivationTanh 2
 
-// Register tile of Conv3x3, set by the host when it builds the program:
-// each work-item computes TILE_BATCH positions x TILE_CHANNELS output
-// channels, so every input value it loads is used TILE_CHANNELS times and
-// every weight TILE_BATCH times.
+// Conv3x3 tiling, set by the host when it builds the program. Each work-item
+// keeps TILE_BATCH positions x TILE_CHANNELS output channels in registers, so
+// every input value it reads is used TILE_CHANNELS times and every weight
+// TILE_BATCH times. TILE_IC input channels are staged in local memory per
+// round (see Conv3x3).
 #ifndef TILE_BATCH
 #define TILE_BATCH 1
 #endif
@@ -22,10 +23,17 @@
 #define TILE_CHANNELS 8
 #endif
 
-// 3x3 convolution with zero padding 1, plus bias, an optional residual input
-// added before ReLU, and an optional ReLU.
-// Global size: (kPlane, out_channels / TILE_CHANNELS,
-//               ceil(batch / TILE_BATCH)).
+#ifndef TILE_IC
+#define TILE_IC 4
+#endif
+#define kPadded (kBoardSize + 2)
+
+// Local-memory 3x3 conv: one work-group of kPlane work-items (one per cell)
+// computes TILE_BATCH positions x TILE_CHANNELS channels for the whole board.
+// Each round the group stages TILE_IC zero-padded input planes per position
+// and the matching weights in local memory, then every work-item reads them.
+// Global size: (kPlane, out_channels / TILE_CHANNELS, ceil(batch / TILE_BATCH))
+// Local size: (kPlane, 1, 1).
 __kernel void Conv3x3(__global const float* input,
                       __global const float* weight,
                       __global const float* bias,
@@ -36,41 +44,60 @@ __kernel void Conv3x3(__global const float* input,
                       const int has_residual,
                       const int apply_relu,
                       const int batch) {
-  const int cell = get_global_id(0);
-  const int oc0 = get_global_id(1) * TILE_CHANNELS;
-  const int b0 = get_global_id(2) * TILE_BATCH;
+  __local float planes[TILE_BATCH][TILE_IC][kPadded * kPadded];
+  __local float weights[TILE_IC][TILE_CHANNELS][9];
+
+  const int cell = get_local_id(0);
+  const int oc0 = get_group_id(1) * TILE_CHANNELS;
+  const int b0 = get_group_id(2) * TILE_BATCH;
   const int row = cell / kBoardSize;
   const int col = cell % kBoardSize;
+  const int padded_cell = (row + 1) * kPadded + col + 1;
+
+  // Zero the border once; later rounds only overwrite the interior.
+  __local float* flat = &planes[0][0][0];
+  for (int i = cell; i < TILE_BATCH * TILE_IC * kPadded * kPadded; i += kPlane)
+    flat[i] = 0.0f;
 
   float sum[TILE_BATCH][TILE_CHANNELS];
-  for (int t = 0; t < TILE_BATCH; ++t) {
+  for (int t = 0; t < TILE_BATCH; ++t)
     for (int o = 0; o < TILE_CHANNELS; ++o) sum[t][o] = bias[oc0 + o];
-  }
+  barrier(CLK_LOCAL_MEM_FENCE);
 
-  for (int ic = 0; ic < in_channels; ++ic) {
-    for (int ky = 0; ky < 3; ++ky) {
-      const int y = row + ky - 1;
-      if (y < 0 || y >= kBoardSize) continue;
-      for (int kx = 0; kx < 3; ++kx) {
-        const int x = col + kx - 1;
-        if (x < 0 || x >= kBoardSize) continue;
+  for (int ic0 = 0; ic0 < in_channels; ic0 += TILE_IC) {
+    for (int t = 0; t < TILE_BATCH; ++t) {
+      const int b = b0 + t;
+      for (int i = 0; i < TILE_IC; ++i) {
+        const int ic = ic0 + i;
+        planes[t][i][padded_cell] =
+            (b < batch && ic < in_channels)
+                ? input[(b * in_channels + ic) * kPlane + cell] : 0.0f;
+      }
+    }
+    for (int k = cell; k < TILE_IC * TILE_CHANNELS * 9; k += kPlane) {
+      const int i = k / (TILE_CHANNELS * 9);
+      const int o = (k / 9) % TILE_CHANNELS;
+      const int j = k % 9;
+      const int ic = ic0 + i;
+      weights[i][o][j] = (ic < in_channels)
+          ? weight[((oc0 + o) * in_channels + ic) * 9 + j] : 0.0f;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Load this input cell once per position in the tile...
-        float value[TILE_BATCH];
-        for (int t = 0; t < TILE_BATCH; ++t) {
-          const int b = b0 + t;
-          value[t] = (b < batch) ? input[(b * in_channels + ic) * kPlane +
-                                         y * kBoardSize + x]
-                                 : 0.0f;
-        }
-        // ...and each weight once per channel, then reuse both.
-        for (int o = 0; o < TILE_CHANNELS; ++o) {
-          const float w =
-              weight[((oc0 + o) * in_channels + ic) * 9 + ky * 3 + kx];
-          for (int t = 0; t < TILE_BATCH; ++t) sum[t][o] += w * value[t];
+    for (int i = 0; i < TILE_IC; ++i) {
+      for (int ky = 0; ky < 3; ++ky) {
+        for (int kx = 0; kx < 3; ++kx) {
+          const int at = padded_cell + (ky - 1) * kPadded + (kx - 1);
+          float value[TILE_BATCH];
+          for (int t = 0; t < TILE_BATCH; ++t) value[t] = planes[t][i][at];
+          for (int o = 0; o < TILE_CHANNELS; ++o) {
+            const float w = weights[i][o][ky * 3 + kx];
+            for (int t = 0; t < TILE_BATCH; ++t) sum[t][o] += w * value[t];
+          }
         }
       }
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
   }
 
   for (int t = 0; t < TILE_BATCH; ++t) {
