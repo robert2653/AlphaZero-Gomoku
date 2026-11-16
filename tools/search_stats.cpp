@@ -6,7 +6,10 @@
 // then paired comparisons: within each round, time(a) / time(b), and how many
 // rounds `b` was faster. Every run is also written to a CSV file.
 //
-// Usage: search_stats [rounds] [playouts] [csv]
+// Usage: search_stats [rounds] [playouts] [csv] [compare|grid]
+//   compare: the workers vs one-thread batching comparisons (default)
+//   grid:    every K (threads) x B (batch size) in {1, 2, 4, 8, 16} with
+//            B <= K, plus one thread filling each B, printed as a table
 // Uses model/alpha-zero.pt on CUDA.
 
 #include <algorithm>
@@ -18,6 +21,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -98,23 +102,45 @@ int main(int argc, char** argv) {
   const int rounds = argc > 1 ? std::atoi(argv[1]) : 30;
   const int playouts = argc > 2 ? std::atoi(argv[2]) : 800;
   const std::string csv_path = argc > 3 ? argv[3] : "search_stats.csv";
+  const bool grid = argc > 4 && std::string(argv[4]) == "grid";
 
-  std::vector<Config> configs = {
-      Workers(1, 1, playouts),  Workers(2, 1, playouts),
-      Workers(4, 1, playouts),  Workers(8, 1, playouts),
-      Workers(8, 8, playouts),  Sequential(8, playouts),
-      Workers(16, 16, playouts), Sequential(16, playouts),
-      Workers(32, 32, playouts), Sequential(32, playouts),
-      Workers(32, 32, playouts),  // Patched below: long batch timeout.
-  };
-  // Same as workers 32/32, but the queue waits up to 100 ms for a full batch
-  // instead of 1 ms, to test whether the timeout splits the batches.
-  configs.back().name = "workers 32/32 t100ms";
-  configs.back().options.batch_timeout_us = 100'000;
-
+  std::vector<Config> configs;
   // Paired comparisons: {a, b} reports time(a) / time(b).
-  const std::vector<std::pair<int, int>> pairs = {
-      {0, 1}, {0, 2}, {0, 3}, {4, 5}, {6, 7}, {8, 9}, {8, 10}, {10, 9}};
+  std::vector<std::pair<int, int>> pairs;
+  // grid_index[k][b] is the config index for K = kSizes[k], B = kSizes[b].
+  constexpr int kSizes[] = {1, 2, 4, 8, 16};
+  constexpr int kNumSizes = std::size(kSizes);
+  int grid_index[kNumSizes][kNumSizes];
+  int sequential_index[kNumSizes];
+
+  if (grid) {
+    for (int k = 0; k < kNumSizes; ++k) {
+      for (int b = 0; b <= k; ++b) {
+        grid_index[k][b] = static_cast<int>(configs.size());
+        configs.push_back(Workers(kSizes[k], kSizes[b], playouts));
+      }
+    }
+    sequential_index[0] = grid_index[0][0];  // One thread, batch 1.
+    for (int b = 1; b < kNumSizes; ++b) {
+      sequential_index[b] = static_cast<int>(configs.size());
+      configs.push_back(Sequential(kSizes[b], playouts));
+      pairs.push_back({grid_index[b][b], sequential_index[b]});
+    }
+  } else {
+    configs = {
+        Workers(1, 1, playouts),   Workers(2, 1, playouts),
+        Workers(4, 1, playouts),   Workers(8, 1, playouts),
+        Workers(8, 8, playouts),   Sequential(8, playouts),
+        Workers(16, 16, playouts), Sequential(16, playouts),
+        Workers(32, 32, playouts), Sequential(32, playouts),
+        Workers(32, 32, playouts),  // Patched below: long batch timeout.
+    };
+    // Same as workers 32/32, but the queue waits up to 100 ms for a full
+    // batch instead of 1 ms, to test whether the timeout splits the batches.
+    configs.back().name = "workers 32/32 t100ms";
+    configs.back().options.batch_timeout_us = 100'000;
+    pairs = {{0, 1}, {0, 2}, {0, 3}, {4, 5}, {6, 7}, {8, 9}, {8, 10}, {10, 9}};
+  }
 
   try {
     PolicyValueNetwork network("model/alpha-zero.pt");
@@ -211,6 +237,33 @@ int main(int argc, char** argv) {
                 << std::setprecision(3) << std::setw(8) << s.mean << "   ["
                 << s.mean - s.half_ci << ", " << s.mean + s.half_ci << "]"
                 << std::setw(6) << b_faster << "/" << rounds << "\n";
+    }
+    if (grid) {
+      const double serial = Summarize(times[grid_index[0][0]]).mean;
+      const auto cell = [&](int index) {
+        const Stats s = Summarize(times[index]);
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(1) << s.mean << " ("
+             << std::setprecision(2) << serial / s.mean << "x)";
+        return text.str();
+      };
+      std::cout << "\nmean ms (speedup over K=1, B=1); rows K threads, "
+                   "columns B batch size\n"
+                << std::left << std::setw(14) << "K \\ B";
+      for (int size : kSizes) std::cout << std::setw(17) << size;
+      std::cout << "\n";
+      for (int k = 0; k < kNumSizes; ++k) {
+        std::cout << std::setw(14) << kSizes[k];
+        for (int b = 0; b < kNumSizes; ++b) {
+          std::cout << std::setw(17) << (b <= k ? cell(grid_index[k][b]) : "-");
+        }
+        std::cout << "\n";
+      }
+      std::cout << std::setw(14) << "1 (seq)";
+      for (int b = 0; b < kNumSizes; ++b) {
+        std::cout << std::setw(17) << cell(sequential_index[b]);
+      }
+      std::cout << std::right << "\n";
     }
     std::cout << "\nraw runs: " << csv_path << "\n";
   } catch (const std::exception& error) {
