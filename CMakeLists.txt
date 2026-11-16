@@ -82,6 +82,11 @@ target_include_directories(gomoku PRIVATE include)
 target_compile_options(gomoku PRIVATE -Wall -Wextra)
 target_link_libraries(gomoku PRIVATE gomoku_nn imgui glfw OpenGL::GL)
 
+# Repeated, interleaved search timings with summary statistics (LibTorch).
+add_executable(search_stats tools/search_stats.cpp)
+target_compile_options(search_stats PRIVATE -Wall -Wextra)
+target_link_libraries(search_stats PRIVATE gomoku_nn "${TORCH_LIBRARIES}")
+
 # Automated tests (enabled by default; disable with -DBUILD_TESTING=OFF)
 include(CTest)
 if (BUILD_TESTING)
