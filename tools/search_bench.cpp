@@ -4,8 +4,10 @@
 // Usage: search_bench <torch|opencl|torch-cpu> [playouts] [repeats]
 //   torch:     uses model/alpha-zero.pt on CUDA
 //   opencl:    uses model/alpha-zero.bin and kernels/policy_value_network.cl
-//   torch-cpu: uses model/alpha-zero.pt on the CPU, one core per inference,
-//              and compares direct per-worker evaluation with batching
+//   torch-cpu: uses model/alpha-zero.pt on the CPU and compares where the
+//              cores go: LibTorch threads inside one inference, MCTS workers
+//              that each evaluate on their own core, mixes of the two, and
+//              batching on one core
 
 #include <algorithm>
 #include <chrono>
@@ -83,8 +85,6 @@ int main(int argc, char** argv) {
     if (backend == "torch") {
       evaluator = std::make_unique<PolicyValueNetwork>("model/alpha-zero.pt");
     } else if (cpu) {
-      // One core per inference, so any speedup comes from our own threads
-      // rather than from LibTorch's intra-op parallelism.
       at::set_num_threads(1);
       evaluator = std::make_unique<PolicyValueNetwork>(
           "model/alpha-zero.pt", PolicyValueNetwork::Device::kCpu);
@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
     std::cout << "backend " << backend << ", " << playouts
               << " playouts, WU-PUCT, median of " << repeats << "\n"
               << std::setw(11) << "source" << std::setw(8) << "threads"
+              << std::setw(7) << "torch"
               << std::setw(7) << "batch" << std::setw(11) << "ms"
               << std::setw(13) << "playouts/s" << std::setw(12)
               << "mean batch" << std::setw(12) << "collisions"
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
       std::cout << std::setw(11)
                 << kBatchSourceNames[static_cast<int>(options.batch_source)]
                 << std::setw(8) << options.num_threads << std::setw(7)
-                << options.batch_size << std::setw(11) << std::fixed
+                << at::get_num_threads() << std::setw(7) << options.batch_size << std::setw(11) << std::fixed
                 << std::setprecision(1) << result.ms << std::setw(13)
                 << std::setprecision(0) << playouts * 1000.0 / result.ms
                 << std::setw(12) << std::setprecision(2) << result.mean_batch
@@ -128,16 +129,25 @@ int main(int argc, char** argv) {
     };
 
     if (cpu) {
-      // Each worker evaluates its own leaf on its own core.
-      for (int threads : {1, 2, 4, 8, 12, 16, 20}) {
+      // "torch" is the number of cores LibTorch uses inside one inference;
+      // "threads" is the number of MCTS workers, each evaluating directly.
+      const auto direct = [&](int workers, int torch_threads) {
+        at::set_num_threads(torch_threads);
         SearchOptions options;
         options.num_playouts = playouts;
-        options.num_threads = threads;
+        options.num_threads = workers;
         options.parallel_mode = ParallelMode::kWuPuct;
         options.batch_source = BatchSource::kDirect;
         report(options);
-      }
+      };
+      // One MCTS thread, cores spent inside each inference.
+      for (int torch_threads : {1, 2, 4, 8, 12, 16, 20}) direct(1, torch_threads);
+      // Cores spent on concurrent playouts, one core per inference.
+      for (int workers : {2, 4, 8, 12, 16, 20}) direct(workers, 1);
+      // Mixes that use 12 cores in total.
+      for (int workers : {2, 3, 4, 6}) direct(workers, 12 / workers);
       // Batching on one core for comparison.
+      at::set_num_threads(1);
       for (int batch : {4, 8}) {
         SearchOptions options;
         options.num_playouts = playouts;
