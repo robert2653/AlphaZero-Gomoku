@@ -71,8 +71,11 @@ float MaxError(const std::vector<Evaluation>& actual,
 }
 
 void TestMatchesPyTorch(OpenCLNetwork& network, const Reference& reference) {
-  // Small batches first so the activation buffers must grow later.
-  for (size_t batch : {size_t{1}, size_t{7}, reference.features.size()}) {
+  // Small batches first so the activation buffers must grow later. The sizes
+  // cover every Conv3x3 batch tile (1, 2, 4, 8), with and without a partly
+  // filled last tile.
+  for (size_t batch : {size_t{1}, size_t{2}, size_t{3}, size_t{7}, size_t{13},
+                       reference.features.size()}) {
     float error = 0.f;
     for (size_t start = 0; start < reference.features.size(); start += batch) {
       const size_t end = std::min(start + batch, reference.features.size());

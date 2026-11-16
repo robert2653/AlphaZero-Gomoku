@@ -22,6 +22,13 @@ constexpr int kActivationNone = 0;
 constexpr int kActivationRelu = 1;
 constexpr int kActivationTanh = 2;
 
+// Conv3x3 register tile (see kernels/policy_value_network.cl). The program is
+// built once per batch tile; RunConv3x3 picks the largest tile that the batch
+// fills, since a tile wider than the batch computes empty positions.
+constexpr int kTileChannels = 8;
+constexpr int kTileBatches[] = {1, 2, 4, 8};
+constexpr int kNumTiles = sizeof(kTileBatches) / sizeof(kTileBatches[0]);
+
 void Check(cl_int status, const char* what) {
   if (status != CL_SUCCESS) {
     throw std::runtime_error(std::string("OpenCL error ") +
@@ -102,8 +109,8 @@ struct OpenCLNetwork::Impl {
   cl_device_id device = nullptr;
   cl_context context = nullptr;
   cl_command_queue queue = nullptr;
-  cl_program program = nullptr;
-  cl_kernel conv3x3 = nullptr;
+  cl_program programs[kNumTiles] = {};  // One build per kTileBatches entry.
+  cl_kernel conv3x3[kNumTiles] = {};
   cl_kernel conv1x1 = nullptr;
   cl_kernel linear = nullptr;
   std::string device_name;
@@ -134,10 +141,12 @@ struct OpenCLNetwork::Impl {
     for (Layer* layer : {&p_conv, &p_fc, &v_conv, &v_fc1, &v_fc2}) {
       Release(*layer);
     }
-    if (conv3x3) clReleaseKernel(conv3x3);
     if (conv1x1) clReleaseKernel(conv1x1);
     if (linear) clReleaseKernel(linear);
-    if (program) clReleaseProgram(program);
+    for (int i = 0; i < kNumTiles; ++i) {
+      if (conv3x3[i]) clReleaseKernel(conv3x3[i]);
+      if (programs[i]) clReleaseProgram(programs[i]);
+    }
     if (queue) clReleaseCommandQueue(queue);
     if (context) clReleaseContext(context);
   }
@@ -210,28 +219,43 @@ struct OpenCLNetwork::Impl {
     Check(status, "clCreateCommandQueue");
 
     const std::string source = ReadText(kernel_path);
+    for (int i = 0; i < kNumTiles; ++i) {
+      const std::string options =
+          "-DTILE_BATCH=" + std::to_string(kTileBatches[i]) +
+          " -DTILE_CHANNELS=" + std::to_string(kTileChannels);
+      programs[i] = Compile(source, options);
+      conv3x3[i] = clCreateKernel(programs[i], "Conv3x3", &status);
+      Check(status, "clCreateKernel(Conv3x3)");
+    }
+
+    // The other kernels do not depend on the tile size.
+    conv1x1 = clCreateKernel(programs[0], "Conv1x1Relu", &status);
+    Check(status, "clCreateKernel(Conv1x1Relu)");
+    linear = clCreateKernel(programs[0], "Linear", &status);
+    Check(status, "clCreateKernel(Linear)");
+  }
+
+  cl_program Compile(const std::string& source, const std::string& options) {
+    cl_int status = CL_SUCCESS;
     const char* text = source.c_str();
     const size_t length = source.size();
-    program = clCreateProgramWithSource(context, 1, &text, &length, &status);
+    cl_program program =
+        clCreateProgramWithSource(context, 1, &text, &length, &status);
     Check(status, "clCreateProgramWithSource");
 
-    if (clBuildProgram(program, 1, &device, "", nullptr, nullptr) !=
-        CL_SUCCESS) {
+    if (clBuildProgram(program, 1, &device, options.c_str(), nullptr,
+                       nullptr) != CL_SUCCESS) {
       size_t log_size = 0;
       clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr,
                             &log_size);
       std::string log(log_size, '\0');
       clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size,
                             log.data(), nullptr);
-      throw std::runtime_error("OpenCL build failed:\n" + log);
+      clReleaseProgram(program);
+      throw std::runtime_error("OpenCL build failed (" + options + "):\n" +
+                               log);
     }
-
-    conv3x3 = clCreateKernel(program, "Conv3x3", &status);
-    Check(status, "clCreateKernel(Conv3x3)");
-    conv1x1 = clCreateKernel(program, "Conv1x1Relu", &status);
-    Check(status, "clCreateKernel(Conv1x1Relu)");
-    linear = clCreateKernel(program, "Linear", &status);
-    Check(status, "clCreateKernel(Linear)");
+    return program;
   }
 
   cl_mem Upload(const std::vector<float>& data) {
@@ -292,6 +316,15 @@ struct OpenCLNetwork::Impl {
         v_fc1.in != v_conv.out * kPlane || v_fc2.out != 1) {
       throw std::runtime_error("Weight file does not match the network");
     }
+    for (const ResBlock& block : blocks) {
+      if (block.conv1.out % kTileChannels != 0 ||
+          block.conv2.out % kTileChannels != 0 ||
+          (block.has_downsample && block.downsample.out % kTileChannels != 0)) {
+        throw std::runtime_error(
+            "Convolution channels must be a multiple of " +
+            std::to_string(kTileChannels));
+      }
+    }
   }
 
   cl_mem CreateBuffer(size_t floats) {
@@ -320,22 +353,30 @@ struct OpenCLNetwork::Impl {
 
   void RunConv3x3(const Layer& layer, cl_mem in, cl_mem residual, cl_mem out,
                   bool relu, int batch) {
+    // Largest batch tile that the batch fills (kTileBatches is ascending).
+    int tile = 0;
+    while (tile + 1 < kNumTiles && kTileBatches[tile + 1] <= batch) ++tile;
+    cl_kernel kernel = conv3x3[tile];
+    const int tile_batch = kTileBatches[tile];
+
     const int has_residual = residual != nullptr;
     const int apply_relu = relu;
-    Check(clSetKernelArg(conv3x3, 0, sizeof(cl_mem), &in), "arg");
-    Check(clSetKernelArg(conv3x3, 1, sizeof(cl_mem), &layer.weight), "arg");
-    Check(clSetKernelArg(conv3x3, 2, sizeof(cl_mem), &layer.bias), "arg");
+    Check(clSetKernelArg(kernel, 0, sizeof(cl_mem), &in), "arg");
+    Check(clSetKernelArg(kernel, 1, sizeof(cl_mem), &layer.weight), "arg");
+    Check(clSetKernelArg(kernel, 2, sizeof(cl_mem), &layer.bias), "arg");
     // The kernel never reads `residual` when has_residual is 0.
     cl_mem residual_arg = residual ? residual : out;
-    Check(clSetKernelArg(conv3x3, 3, sizeof(cl_mem), &residual_arg), "arg");
-    Check(clSetKernelArg(conv3x3, 4, sizeof(cl_mem), &out), "arg");
-    Check(clSetKernelArg(conv3x3, 5, sizeof(int), &layer.in), "arg");
-    Check(clSetKernelArg(conv3x3, 6, sizeof(int), &layer.out), "arg");
-    Check(clSetKernelArg(conv3x3, 7, sizeof(int), &has_residual), "arg");
-    Check(clSetKernelArg(conv3x3, 8, sizeof(int), &apply_relu), "arg");
-    const size_t global[3] = {kPlane, static_cast<size_t>(layer.out),
-                              static_cast<size_t>(batch)};
-    Check(clEnqueueNDRangeKernel(queue, conv3x3, 3, nullptr, global, nullptr,
+    Check(clSetKernelArg(kernel, 3, sizeof(cl_mem), &residual_arg), "arg");
+    Check(clSetKernelArg(kernel, 4, sizeof(cl_mem), &out), "arg");
+    Check(clSetKernelArg(kernel, 5, sizeof(int), &layer.in), "arg");
+    Check(clSetKernelArg(kernel, 6, sizeof(int), &layer.out), "arg");
+    Check(clSetKernelArg(kernel, 7, sizeof(int), &has_residual), "arg");
+    Check(clSetKernelArg(kernel, 8, sizeof(int), &apply_relu), "arg");
+    Check(clSetKernelArg(kernel, 9, sizeof(int), &batch), "arg");
+    const size_t global[3] = {
+        kPlane, static_cast<size_t>(layer.out / kTileChannels),
+        static_cast<size_t>((batch + tile_batch - 1) / tile_batch)};
+    Check(clEnqueueNDRangeKernel(queue, kernel, 3, nullptr, global, nullptr,
                                  0, nullptr, nullptr),
           "clEnqueueNDRangeKernel(Conv3x3)");
   }
