@@ -1053,6 +1053,123 @@ void ParallelSearchSpreadsWorkers() {
   }
 }
 
+SearchOptions SequentialOptions(ParallelMode mode, int batch, int playouts) {
+  SearchOptions options = ParallelOptions(mode, 1, batch, playouts);
+  options.batch_source = BatchSource::kSequential;
+  return options;
+}
+
+void SequentialBatchSearch() {
+  // Batch size 1 is the serial search.
+  FakeEvaluator serial_evaluator;
+  serial_evaluator.evaluate = [](const GamePosition& position) {
+    Evaluation evaluation;
+    for (Action action = 0; action < kActionCount; ++action) {
+      evaluation.policy[action] = 1.f + static_cast<float>(action % 5);
+    }
+    const float sum = std::accumulate(evaluation.policy.begin(),
+                                      evaluation.policy.end(), 0.f);
+    for (float& prior : evaluation.policy) prior /= sum;
+    evaluation.value =
+        static_cast<float>(position.board().stone_count() % 3) / 3.f - 0.3f;
+    return evaluation;
+  };
+  MCTS serial(ParallelOptions(ParallelMode::kWuPuct, 1, 1, 200));
+  MCTS sequential(SequentialOptions(ParallelMode::kWuPuct, 1, 200));
+  const auto expected = serial.Search(GamePosition(), serial_evaluator);
+  const auto actual = sequential.Search(GamePosition(), serial_evaluator);
+  CHECK(actual.size() == expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    CHECK(actual[i].visits == expected[i].visits);
+    CHECK(Near(actual[i].value, expected[i].value));
+  }
+
+  // One thread fills each batch the way eight workers would.
+  for (ParallelMode mode : kParallelModes) {
+    MCTS search(SequentialOptions(mode, 8, 16));
+    BatchRecorder evaluator;
+    SearchTiming timing;
+    search.Search(GamePosition(), evaluator, &timing);
+
+    CHECK(search.CountInFlight() == 0);
+    CHECK(timing.playouts == 16);
+    CHECK(timing.batches == static_cast<int>(evaluator.batches.size()));
+    CHECK(timing.batched_positions == static_cast<int>(evaluator.positions()));
+    CHECK(timing.collisions == (mode == ParallelMode::kNone ? 14 : 7));
+
+    CHECK(evaluator.batches.size() == 2);
+    CHECK(evaluator.batches[0].size() == 8);
+    std::vector<Action> leaves;
+    for (const GamePosition& leaf : evaluator.batches[1]) {
+      leaves.push_back(*leaf.last_move());
+    }
+    std::sort(leaves.begin(), leaves.end());
+    const auto distinct = static_cast<size_t>(
+        std::unique(leaves.begin(), leaves.end()) - leaves.begin());
+    CHECK(distinct == (mode == ParallelMode::kNone ? 1u : 8u));
+  }
+
+  // The last batch takes what is left of the playout budget, across moves.
+  for (int batch : {3, 8, 64}) {
+    MCTS search(SequentialOptions(ParallelMode::kVirtualLoss, batch, 50));
+    BatchRecorder evaluator;
+    GamePosition position;
+    for (int move = 0; move < 3; ++move) {
+      SearchTiming timing;
+      const auto moves = search.Search(position, evaluator, &timing);
+      CHECK(timing.playouts == 50);
+      CHECK(search.CountInFlight() == 0);
+      for (const auto& recorded : evaluator.batches) {
+        CHECK(!recorded.empty());
+        CHECK(recorded.size() <= static_cast<size_t>(batch));
+      }
+      const auto best = std::max_element(
+          moves.begin(), moves.end(),
+          [](const MoveVisits& a, const MoveVisits& b) {
+            return a.visits < b.visits;
+          });
+      position.PlayMove(best->action);
+      search.ObserveMove(best->action);
+    }
+  }
+
+  // Terminal leaves are backed up without an evaluation.
+  {
+    MCTS search(SequentialOptions(ParallelMode::kWuPuct, 4, 40));
+    BatchRecorder evaluator;
+    evaluator.policy.fill(0.f);
+    evaluator.policy[ToAction(7, 4)] = 1.f;  // The winning move.
+    SearchTiming timing;
+    search.Search(PositionBeforeWin(Player::kBlack), evaluator, &timing);
+    CHECK(timing.playouts == 40);
+    CHECK(timing.batched_positions < 40);
+    CHECK(search.CountInFlight() == 0);
+  }
+
+  // An evaluator failure resets the tree and is reported.
+  {
+    BatchRecorder evaluator;
+    evaluator.fail = true;
+    MCTS search(SequentialOptions(ParallelMode::kVirtualLoss, 4, 20));
+    CheckThrows<std::runtime_error>(
+        [&] { search.Search(GamePosition(), evaluator); });
+    CHECK(search.CountInFlight() == 0);
+  }
+
+  // Validation: one thread only, and the batch is not tied to num_threads.
+  SearchOptions valid = SequentialOptions(ParallelMode::kWuPuct, 32, 100);
+  CHECK(valid.IsValid());
+  SearchOptions two_threads = valid;
+  two_threads.num_threads = 2;
+  CHECK(two_threads.Validate() ==
+        std::vector<std::string>(
+            {"sequential batching requires num_threads = 1"}));
+  SearchOptions too_large = valid;
+  too_large.batch_size = SearchOptions::kMaxThreads + 1;
+  CHECK(too_large.Validate() ==
+        std::vector<std::string>({"sequential batch_size must be in 1..64"}));
+}
+
 void ThinkTimeLimit() {
   BatchRecorder evaluator;
   evaluator.delay = std::chrono::microseconds(200);
@@ -1463,6 +1580,7 @@ int main() {
       {"single-worker parallel modes agree", SingleWorkerModesAgree},
       {"parallel search invariants", ParallelSearchInvariants},
       {"parallel search spreads workers", ParallelSearchSpreadsWorkers},
+      {"sequential batch search", SequentialBatchSearch},
       {"think-time search limit", ThinkTimeLimit},
       {"parallel search errors", ParallelSearchErrors},
       {"inference queue batching", InferenceQueueBatching},

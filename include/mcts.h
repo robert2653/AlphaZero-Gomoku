@@ -25,10 +25,21 @@ enum class SearchLimit {
   kThinkTime,
 };
 
+// Who fills each evaluator batch.
+enum class BatchSource {
+  // `num_threads` workers each submit one leaf to a shared inference queue.
+  kWorkers,
+  // One thread selects `batch_size` leaves in a row, steering later
+  // selections with the same pre-updates as `parallel_mode`, then evaluates
+  // them together. No queue and no worker threads.
+  kSequential,
+};
+
 // Configuration and UI labels for search enums.
 inline constexpr const char* kParallelModeNames[] = {"none", "virtual_loss",
                                                      "wu_puct"};
 inline constexpr const char* kSearchLimitNames[] = {"playouts", "think_time"};
+inline constexpr const char* kBatchSourceNames[] = {"workers", "sequential"};
 
 // Hyperparameters for MCTS search and move sampling.
 struct SearchOptions {
@@ -47,6 +58,7 @@ struct SearchOptions {
   int num_threads = 1;
   int batch_size = 1;
   int batch_timeout_us = 1000;
+  BatchSource batch_source = BatchSource::kWorkers;
 
   // Returns validation error messages, or an empty list if valid.
   std::vector<std::string> Validate() const;
@@ -140,6 +152,13 @@ class MCTS {
  private:
   struct TreeNode;
   class Worker;
+
+  // Runs the search for BatchSource::kSequential on the calling thread.
+  void SearchSequential(const GamePosition& position,
+                        PolicyValueEvaluator& evaluator, SearchTiming* timing);
+
+  // Visit statistics of the root's children.
+  std::vector<MoveVisits> RootVisits() const;
 
   SearchOptions options_;
   std::unique_ptr<TreeNode> root_;

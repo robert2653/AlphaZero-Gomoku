@@ -157,9 +157,27 @@ const OptionRule kOptionRules[] = {
     },
     {
         [](const SearchOptions& o) {
-          return o.batch_size > 0 && o.batch_size <= o.num_threads;
+          return o.batch_source == BatchSource::kSequential ||
+                 (o.batch_size > 0 && o.batch_size <= o.num_threads);
         },
         "batch_size must be in 1..num_threads",
+        ResetField<&SearchOptions::batch_size>,
+    },
+    {
+        [](const SearchOptions& o) {
+          return o.batch_source != BatchSource::kSequential ||
+                 o.num_threads == 1;
+        },
+        "sequential batching requires num_threads = 1",
+        ResetField<&SearchOptions::num_threads>,
+    },
+    {
+        [](const SearchOptions& o) {
+          return o.batch_source != BatchSource::kSequential ||
+                 (o.batch_size > 0 &&
+                  o.batch_size <= SearchOptions::kMaxThreads);
+        },
+        "sequential batch_size must be in 1..64",
         ResetField<&SearchOptions::batch_size>,
     },
 };
@@ -236,10 +254,7 @@ class MCTS::Worker {
 
     float leaf_value = 0.0f;
     if (position.is_terminal()) {
-      if (position.winner().has_value()) {
-        leaf_value =
-            (*position.winner() == position.current_player()) ? 1.0f : -1.0f;
-      }
+      leaf_value = TerminalValue(position);
     } else {
       Evaluation evaluation;
       {
@@ -255,9 +270,66 @@ class MCTS::Worker {
     ++timing_.playouts;
   }
 
+  // Runs `count` simulations from this thread as one evaluator batch: selects
+  // the leaves one after another, each selection's pre-update steering the
+  // next, evaluates the non-terminal ones together, then expands and backs
+  // up each leaf in selection order.
+  void PlayoutBatch(PolicyValueEvaluator& evaluator, int count) {
+    struct SelectedLeaf {
+      std::vector<TreeNode*> path;
+      GamePosition position;
+    };
+    std::vector<SelectedLeaf> leaves;
+    std::vector<GamePosition> pending;
+    leaves.reserve(count);
+    pending.reserve(count);
+
+    for (int i = 0; i < count; ++i) {
+      GamePosition position = position_;
+      SelectLeaf(position);
+      if (!position.is_terminal()) pending.push_back(position);
+      leaves.push_back({path_, std::move(position)});
+    }
+
+    std::vector<Evaluation> evaluations;
+    if (!pending.empty()) {
+      const Clock::time_point start = Clock::now();
+      evaluations = evaluator.EvaluateBatch(pending);
+      assert(evaluations.size() == pending.size());
+      const double elapsed_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - start)
+              .count();
+      timing_.evaluation_ms += elapsed_ms;
+      timing_.inference_ms += elapsed_ms;
+      ++timing_.batches;
+      timing_.batched_positions += static_cast<std::int64_t>(pending.size());
+    }
+
+    size_t next = 0;
+    for (SelectedLeaf& leaf : leaves) {
+      path_ = std::move(leaf.path);
+      float leaf_value = 0.0f;
+      if (leaf.position.is_terminal()) {
+        leaf_value = TerminalValue(leaf.position);
+      } else {
+        const Evaluation& evaluation = evaluations[next++];
+        leaf_value = evaluation.value;
+        Expand(*path_.back(), leaf.position, evaluation);
+      }
+      Backup(leaf_value);
+      ++timing_.playouts;
+    }
+  }
+
   const SearchTiming& timing() const { return timing_; }
 
  private:
+  // Returns the final result from the perspective of the player to move.
+  static float TerminalValue(const GamePosition& position) {
+    if (!position.winner().has_value()) return 0.0f;
+    return (*position.winner() == position.current_player()) ? 1.0f : -1.0f;
+  }
+
   // Traverses the tree from the root to a leaf node using PUCT selection.
   TreeNode* SelectLeaf(GamePosition& position) {
     PhaseTimer timer(&timing_, &SearchTiming::selection_ms);
@@ -409,6 +481,11 @@ std::vector<MoveVisits> MCTS::Search(const GamePosition& position,
   if (timing) *timing = {};
   if (position.is_terminal()) return {};
 
+  if (options_.batch_source == BatchSource::kSequential) {
+    SearchSequential(position, evaluator, timing);
+    return RootVisits();
+  }
+
   const int num_workers = options_.num_threads;
   InferenceQueue queue(evaluator, options_.batch_size,
                        std::chrono::microseconds(options_.batch_timeout_us));
@@ -471,6 +548,39 @@ std::vector<MoveVisits> MCTS::Search(const GamePosition& position,
     timing->batched_positions = stats.batched_positions;
   }
 
+  return RootVisits();
+}
+
+void MCTS::SearchSequential(const GamePosition& position,
+                            PolicyValueEvaluator& evaluator,
+                            SearchTiming* timing) {
+  Worker worker(options_, *root_, position);
+  const Clock::time_point deadline =
+      Clock::now() + std::chrono::milliseconds(options_.think_time_ms);
+
+  try {
+    int done = 0;
+    while (true) {
+      int count = options_.batch_size;
+      if (options_.search_limit == SearchLimit::kThinkTime) {
+        if (Clock::now() >= deadline) break;
+      } else {
+        count = std::min(count, options_.num_playouts - done);
+        if (count <= 0) break;
+      }
+      worker.PlayoutBatch(evaluator, count);
+      done += count;
+    }
+  } catch (...) {
+    Reset();
+    throw;
+  }
+  assert(CountInFlight() == 0);
+
+  if (timing) *timing = worker.timing();
+}
+
+std::vector<MoveVisits> MCTS::RootVisits() const {
   std::vector<MoveVisits> move_stats;
   move_stats.reserve(root_->children.size());
   for (const TreeNode& child : root_->children) {

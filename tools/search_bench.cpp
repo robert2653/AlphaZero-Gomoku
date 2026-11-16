@@ -95,12 +95,29 @@ int main(int argc, char** argv) {
 
     std::cout << "backend " << backend << ", " << playouts
               << " playouts, WU-PUCT, median of " << repeats << "\n"
-              << std::setw(8) << "threads" << std::setw(7) << "batch"
-              << std::setw(11) << "ms" << std::setw(13) << "playouts/s"
-              << std::setw(12) << "mean batch" << std::setw(12)
-              << "collisions" << std::setw(10) << "speedup\n";
+              << std::setw(11) << "source" << std::setw(8) << "threads"
+              << std::setw(7) << "batch" << std::setw(11) << "ms"
+              << std::setw(13) << "playouts/s" << std::setw(12)
+              << "mean batch" << std::setw(12) << "collisions"
+              << std::setw(10) << "speedup\n";
 
     double baseline_ms = 0.0;
+    const auto report = [&](const SearchOptions& options) {
+      const Result result = Run(*evaluator, options, repeats);
+      if (baseline_ms == 0.0) baseline_ms = result.ms;
+      std::cout << std::setw(11)
+                << kBatchSourceNames[static_cast<int>(options.batch_source)]
+                << std::setw(8) << options.num_threads << std::setw(7)
+                << options.batch_size << std::setw(11) << std::fixed
+                << std::setprecision(1) << result.ms << std::setw(13)
+                << std::setprecision(0) << playouts * 1000.0 / result.ms
+                << std::setw(12) << std::setprecision(2) << result.mean_batch
+                << std::setw(12) << result.collisions << std::setw(9)
+                << baseline_ms / result.ms << "x\n";
+    };
+
+    // Worker threads: each thread count without and with batching. The first
+    // row (1 thread, batch 1) is the serial baseline for the speedup column.
     for (int threads : {1, 2, 4, 8, 16, 32}) {
       std::vector<int> batches = {1};
       if (threads > 1) batches.push_back(threads);
@@ -110,17 +127,18 @@ int main(int argc, char** argv) {
         options.num_threads = threads;
         options.batch_size = batch;
         options.parallel_mode = ParallelMode::kWuPuct;
-
-        const Result result = Run(*evaluator, options, repeats);
-        if (threads == 1) baseline_ms = result.ms;
-        std::cout << std::setw(8) << threads << std::setw(7) << batch
-                  << std::setw(11) << std::fixed << std::setprecision(1)
-                  << result.ms << std::setw(13) << std::setprecision(0)
-                  << playouts * 1000.0 / result.ms << std::setw(12)
-                  << std::setprecision(2) << result.mean_batch
-                  << std::setw(12) << result.collisions << std::setw(9)
-                  << baseline_ms / result.ms << "x\n";
+        report(options);
       }
+    }
+
+    // One thread filling the same batch sizes by itself.
+    for (int batch : {2, 4, 8, 16, 32}) {
+      SearchOptions options;
+      options.num_playouts = playouts;
+      options.batch_size = batch;
+      options.parallel_mode = ParallelMode::kWuPuct;
+      options.batch_source = BatchSource::kSequential;
+      report(options);
     }
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << "\n";
