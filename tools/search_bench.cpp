@@ -131,6 +131,17 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Twice as many workers as the batch size: while one batch is on the
+    // device, the other half of the workers can already fill the next one.
+    for (int batch : {2, 4, 8, 16, 32}) {
+      SearchOptions options;
+      options.num_playouts = playouts;
+      options.num_threads = 2 * batch;
+      options.batch_size = batch;
+      options.parallel_mode = ParallelMode::kWuPuct;
+      report(options);
+    }
+
     // One thread filling the same batch sizes by itself.
     for (int batch : {2, 4, 8, 16, 32}) {
       SearchOptions options;
