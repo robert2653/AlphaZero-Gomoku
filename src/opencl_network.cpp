@@ -24,10 +24,12 @@ constexpr int kActivationTanh = 2;
 
 // Conv3x3 register tile (see kernels/policy_value_network.cl). The program is
 // built once per batch tile; RunConv3x3 picks the largest tile that the batch
-// fills, since a tile wider than the batch computes empty positions.
+// fills, since a tile wider than the batch computes empty positions, but no
+// larger than keeps kGroupsPerComputeUnit work-groups per compute unit busy.
 constexpr int kTileChannels = 8;
 constexpr int kTileBatches[] = {1, 2, 4, 8};
 constexpr int kNumTiles = sizeof(kTileBatches) / sizeof(kTileBatches[0]);
+constexpr int kGroupsPerComputeUnit = 2;
 
 void Check(cl_int status, const char* what) {
   if (status != CL_SUCCESS) {
@@ -114,6 +116,7 @@ struct OpenCLNetwork::Impl {
   cl_kernel conv1x1 = nullptr;
   cl_kernel linear = nullptr;
   std::string device_name;
+  int min_groups = 0;  // Conv3x3 work-groups needed to fill the device.
 
   ResBlock blocks[kNumResBlocks];
   Layer p_conv, p_fc, v_conv, v_fc1, v_fc2;
@@ -209,6 +212,11 @@ struct OpenCLNetwork::Impl {
     char name[256] = {};
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
     device_name = name;
+
+    cl_uint compute_units = 0;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units),
+                    &compute_units, nullptr);
+    min_groups = kGroupsPerComputeUnit * static_cast<int>(compute_units);
 
     // Conv3x3 runs one work-group per board, one work-item per cell.
     size_t max_group = 0;
@@ -363,9 +371,15 @@ struct OpenCLNetwork::Impl {
 
   void RunConv3x3(const Layer& layer, cl_mem in, cl_mem residual, cl_mem out,
                   bool relu, int batch) {
-    // Largest batch tile that the batch fills (kTileBatches is ascending).
+    // Largest batch tile that the batch fills (kTileBatches is ascending),
+    // then smaller while it would leave too few work-groups for the device.
+    const int channel_groups = layer.out / kTileChannels;
+    const auto groups = [&](int t) {
+      return (batch + kTileBatches[t] - 1) / kTileBatches[t] * channel_groups;
+    };
     int tile = 0;
     while (tile + 1 < kNumTiles && kTileBatches[tile + 1] <= batch) ++tile;
+    while (tile > 0 && groups(tile) < min_groups) --tile;
     cl_kernel kernel = conv3x3[tile];
     const int tile_batch = kTileBatches[tile];
 
