@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -180,6 +181,13 @@ const OptionRule kOptionRules[] = {
         "sequential batch_size must be in 1..64",
         ResetField<&SearchOptions::batch_size>,
     },
+    {
+        [](const SearchOptions& o) {
+          return o.batch_source != BatchSource::kDirect || o.batch_size == 1;
+        },
+        "direct evaluation requires batch_size = 1",
+        ResetField<&SearchOptions::batch_size>,
+    },
 };
 
 static_assert(kActionCount == 225 && SearchOptions::kMaxThreads == 64,
@@ -247,8 +255,11 @@ class MCTS::Worker {
          const GamePosition& position)
       : options_(options), root_(root), position_(position) {}
 
-  // Runs one simulation: select, evaluate, expand, and back up.
-  void Playout(InferenceQueue::Client& queue) {
+  // Runs one simulation: select, evaluate, expand, and back up. `evaluate`
+  // maps a position to its Evaluation (through the inference queue, or by
+  // calling the evaluator directly).
+  template <typename EvaluateFn>
+  void Playout(EvaluateFn&& evaluate) {
     GamePosition position = position_;
     TreeNode* leaf = SelectLeaf(position);
 
@@ -259,7 +270,7 @@ class MCTS::Worker {
       Evaluation evaluation;
       {
         PhaseTimer timer(&timing_, &SearchTiming::evaluation_ms);
-        evaluation = queue.Evaluate(position);
+        evaluation = evaluate(position);
       }
       leaf_value = evaluation.value;
 
@@ -487,16 +498,22 @@ std::vector<MoveVisits> MCTS::Search(const GamePosition& position,
   }
 
   const int num_workers = options_.num_threads;
-  InferenceQueue queue(evaluator, options_.batch_size,
-                       std::chrono::microseconds(options_.batch_timeout_us));
+  const bool direct = options_.batch_source == BatchSource::kDirect;
+
+  // Direct evaluation bypasses the queue and its batch evaluator thread.
+  std::optional<InferenceQueue> queue;
+  if (!direct) {
+    queue.emplace(evaluator, options_.batch_size,
+                  std::chrono::microseconds(options_.batch_timeout_us));
+  }
+  std::atomic<std::int64_t> direct_evaluations{0};
 
   std::vector<Worker> workers;
-  std::vector<InferenceQueue::Client> clients;
+  std::vector<std::optional<InferenceQueue::Client>> clients(num_workers);
   workers.reserve(num_workers);
-  clients.reserve(num_workers);
   for (int i = 0; i < num_workers; ++i) {
     workers.emplace_back(options_, *root_, position);
-    clients.push_back(queue.Connect());
+    if (queue) clients[i].emplace(queue->Connect());
   }
 
   // Shared playout budget across all worker threads.
@@ -524,7 +541,18 @@ std::vector<MoveVisits> MCTS::Search(const GamePosition& position,
       threads.Spawn([&, worker = &workers[i],
                      client = std::move(clients[i])]() mutable {
         try {
-          while (claim_playout()) worker->Playout(client);
+          while (claim_playout()) {
+            if (client) {
+              worker->Playout([&](const GamePosition& leaf) {
+                return client->Evaluate(leaf);
+              });
+            } else {
+              worker->Playout([&](const GamePosition& leaf) {
+                direct_evaluations.fetch_add(1, std::memory_order_relaxed);
+                return evaluator.Evaluate(leaf);
+              });
+            }
+          }
         } catch (...) {
           std::lock_guard lock(error_mutex);
           if (!first_error) first_error = std::current_exception();
@@ -542,10 +570,17 @@ std::vector<MoveVisits> MCTS::Search(const GamePosition& position,
 
   if (timing) {
     for (const Worker& worker : workers) *timing += worker.timing();
-    const InferenceQueue::Stats stats = queue.stats();
-    timing->inference_ms = stats.inference_ms;
-    timing->batches = stats.batches;
-    timing->batched_positions = stats.batched_positions;
+    if (queue) {
+      const InferenceQueue::Stats stats = queue->stats();
+      timing->inference_ms = stats.inference_ms;
+      timing->batches = stats.batches;
+      timing->batched_positions = stats.batched_positions;
+    } else {
+      // Every direct call is a batch of one, timed inside the worker.
+      timing->inference_ms = timing->evaluation_ms;
+      timing->batches = direct_evaluations.load();
+      timing->batched_positions = timing->batches;
+    }
   }
 
   return RootVisits();

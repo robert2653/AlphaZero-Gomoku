@@ -33,13 +33,18 @@ enum class BatchSource {
   // selections with the same pre-updates as `parallel_mode`, then evaluates
   // them together. No queue and no worker threads.
   kSequential,
+  // `num_threads` workers each call the evaluator themselves, one position
+  // at a time and concurrently, with no queue and no batching. Meant for an
+  // evaluator that runs on the CPU, where each worker uses its own core.
+  kDirect,
 };
 
 // Configuration and UI labels for search enums.
 inline constexpr const char* kParallelModeNames[] = {"none", "virtual_loss",
                                                      "wu_puct"};
 inline constexpr const char* kSearchLimitNames[] = {"playouts", "think_time"};
-inline constexpr const char* kBatchSourceNames[] = {"workers", "sequential"};
+inline constexpr const char* kBatchSourceNames[] = {"workers", "sequential",
+                                                    "direct"};
 
 // Hyperparameters for MCTS search and move sampling.
 struct SearchOptions {

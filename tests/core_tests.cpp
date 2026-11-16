@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -1170,6 +1171,113 @@ void SequentialBatchSearch() {
         std::vector<std::string>({"sequential batch_size must be in 1..64"}));
 }
 
+// Thread-safe evaluator that records how many calls overlap.
+class ConcurrentRecorder : public PolicyValueEvaluator {
+ public:
+  std::chrono::microseconds delay{0};
+  std::atomic<int> calls{0};
+  std::atomic<int> active{0};
+  std::atomic<int> max_active{0};
+
+  Evaluation Evaluate(const GamePosition& position) override {
+    CHECK(!position.is_terminal());
+    ++calls;
+    const int now = ++active;
+    int seen = max_active.load();
+    while (now > seen && !max_active.compare_exchange_weak(seen, now)) {
+    }
+    if (delay.count() > 0) std::this_thread::sleep_for(delay);
+    --active;
+
+    Evaluation evaluation;
+    evaluation.policy.fill(1.f / kActionCount);
+    evaluation.value = 0.1f;
+    return evaluation;
+  }
+
+  std::vector<Evaluation> EvaluateBatch(
+      const std::vector<GamePosition>&) override {
+    throw std::runtime_error("direct evaluation must not batch");
+  }
+};
+
+SearchOptions DirectOptions(ParallelMode mode, int threads, int playouts) {
+  SearchOptions options = ParallelOptions(mode, threads, 1, playouts);
+  options.batch_source = BatchSource::kDirect;
+  return options;
+}
+
+void DirectEvaluationSearch() {
+  // One direct worker is the serial search.
+  FakeEvaluator evaluator;
+  evaluator.evaluate = [](const GamePosition& position) {
+    Evaluation evaluation;
+    for (Action action = 0; action < kActionCount; ++action) {
+      evaluation.policy[action] = 1.f + static_cast<float>(action % 3);
+    }
+    const float sum = std::accumulate(evaluation.policy.begin(),
+                                      evaluation.policy.end(), 0.f);
+    for (float& prior : evaluation.policy) prior /= sum;
+    evaluation.value =
+        static_cast<float>(position.board().stone_count() % 4) / 4.f - 0.3f;
+    return evaluation;
+  };
+  MCTS serial(ParallelOptions(ParallelMode::kWuPuct, 1, 1, 200));
+  MCTS direct(DirectOptions(ParallelMode::kWuPuct, 1, 200));
+  const auto expected = serial.Search(GamePosition(), evaluator);
+  const auto actual = direct.Search(GamePosition(), evaluator);
+  CHECK(actual.size() == expected.size());
+  for (size_t i = 0; i < expected.size(); ++i) {
+    CHECK(actual[i].visits == expected[i].visits);
+    CHECK(Near(actual[i].value, expected[i].value));
+  }
+
+  // Workers call the evaluator themselves, at the same time, across moves.
+  for (ParallelMode mode : kParallelModes) {
+    for (int threads : {2, 4, 8}) {
+      ConcurrentRecorder recorder;
+      recorder.delay = std::chrono::microseconds(300);
+      MCTS search(DirectOptions(mode, threads, 120));
+      GamePosition position;
+      for (int move = 0; move < 2; ++move) {
+        SearchTiming timing;
+        const auto moves = search.Search(position, recorder, &timing);
+        CHECK(search.CountInFlight() == 0);
+        CHECK(timing.playouts == 120);
+        CHECK(timing.batches == timing.batched_positions);
+        CHECK(TotalVisits(moves) >= 120 - threads);
+
+        const auto best = std::max_element(
+            moves.begin(), moves.end(),
+            [](const MoveVisits& a, const MoveVisits& b) {
+              return a.visits < b.visits;
+            });
+        position.PlayMove(best->action);
+        search.ObserveMove(best->action);
+      }
+      CHECK(recorder.max_active.load() > 1);
+      CHECK(recorder.max_active.load() <= threads);
+    }
+  }
+
+  // An evaluator failure stops every worker and resets the tree.
+  {
+    BatchRecorder failing;
+    failing.fail = true;
+    MCTS search(DirectOptions(ParallelMode::kVirtualLoss, 4, 50));
+    CheckThrows<std::runtime_error>(
+        [&] { search.Search(GamePosition(), failing); });
+    CHECK(search.CountInFlight() == 0);
+  }
+
+  // Validation: direct calls never batch, but any thread count is allowed.
+  CHECK(DirectOptions(ParallelMode::kWuPuct, 16, 100).IsValid());
+  SearchOptions batched = DirectOptions(ParallelMode::kWuPuct, 4, 100);
+  batched.batch_size = 2;
+  CHECK(batched.Validate() ==
+        std::vector<std::string>({"direct evaluation requires batch_size = 1"}));
+}
+
 void ThinkTimeLimit() {
   BatchRecorder evaluator;
   evaluator.delay = std::chrono::microseconds(200);
@@ -1581,6 +1689,7 @@ int main() {
       {"parallel search invariants", ParallelSearchInvariants},
       {"parallel search spreads workers", ParallelSearchSpreadsWorkers},
       {"sequential batch search", SequentialBatchSearch},
+      {"direct evaluation search", DirectEvaluationSearch},
       {"think-time search limit", ThinkTimeLimit},
       {"parallel search errors", ParallelSearchErrors},
       {"inference queue batching", InferenceQueueBatching},

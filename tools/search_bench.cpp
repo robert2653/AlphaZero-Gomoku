@@ -1,9 +1,11 @@
 // Times the parallel MCTS with either backend over a grid of thread counts
 // and batch sizes, so LibTorch and OpenCL are measured the same way.
 //
-// Usage: search_bench <torch|opencl> [playouts] [repeats]
-//   torch:  uses model/alpha-zero.pt on CUDA
-//   opencl: uses model/alpha-zero.bin and kernels/policy_value_network.cl
+// Usage: search_bench <torch|opencl|torch-cpu> [playouts] [repeats]
+//   torch:     uses model/alpha-zero.pt on CUDA
+//   opencl:    uses model/alpha-zero.bin and kernels/policy_value_network.cl
+//   torch-cpu: uses model/alpha-zero.pt on the CPU, one core per inference,
+//              and compares direct per-worker evaluation with batching
 
 #include <algorithm>
 #include <chrono>
@@ -14,6 +16,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <ATen/Parallel.h>
 
 #include "mcts.h"
 #include "opencl_network.h"
@@ -75,8 +79,15 @@ int main(int argc, char** argv) {
 
   try {
     std::unique_ptr<PolicyValueEvaluator> evaluator;
+    const bool cpu = backend == "torch-cpu";
     if (backend == "torch") {
       evaluator = std::make_unique<PolicyValueNetwork>("model/alpha-zero.pt");
+    } else if (cpu) {
+      // One core per inference, so any speedup comes from our own threads
+      // rather than from LibTorch's intra-op parallelism.
+      at::set_num_threads(1);
+      evaluator = std::make_unique<PolicyValueNetwork>(
+          "model/alpha-zero.pt", PolicyValueNetwork::Device::kCpu);
     } else if (backend == "opencl") {
       evaluator = std::make_unique<OpenCLNetwork>(
           "model/alpha-zero.bin", "kernels/policy_value_network.cl");
@@ -115,6 +126,28 @@ int main(int argc, char** argv) {
                 << std::setw(12) << result.collisions << std::setw(9)
                 << baseline_ms / result.ms << "x\n";
     };
+
+    if (cpu) {
+      // Each worker evaluates its own leaf on its own core.
+      for (int threads : {1, 2, 4, 8, 12, 16, 20}) {
+        SearchOptions options;
+        options.num_playouts = playouts;
+        options.num_threads = threads;
+        options.parallel_mode = ParallelMode::kWuPuct;
+        options.batch_source = BatchSource::kDirect;
+        report(options);
+      }
+      // Batching on one core for comparison.
+      for (int batch : {4, 8}) {
+        SearchOptions options;
+        options.num_playouts = playouts;
+        options.batch_size = batch;
+        options.parallel_mode = ParallelMode::kWuPuct;
+        options.batch_source = BatchSource::kSequential;
+        report(options);
+      }
+      return 0;
+    }
 
     // Worker threads: each thread count without and with batching. The first
     // row (1 thread, batch 1) is the serial baseline for the speedup column.
