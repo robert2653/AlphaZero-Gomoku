@@ -11,6 +11,12 @@ results/matches/<matchup>/ and results/matches/summary.csv.
 
 Usage (from the repository root, after building):
     python3 tools/run_matches.py [games] [matchup ...]
+    python3 tools/run_matches.py --paired [pairs] [matchup ...]
+
+--paired plays the PAIRED matchups with ./build/pair_match: every opening
+twice with colors swapped, scored per opening (0, 0.5 or 1 for player 1),
+which cancels the first-move advantage. Results go to
+results/paired/<matchup>.csv and results/paired/summary.csv.
 """
 
 import csv
@@ -59,6 +65,19 @@ MATCHUPS = {
     "time_wu16_vs_seq16": (
         think_time(parallel_mode="wu_puct", **WORKERS16),
         think_time(parallel_mode="wu_puct", **SEQUENTIAL16)),
+}
+
+
+PAIRED_THINK_MS = 100
+
+# Fixed think time per move; player 1 is A, player 2 is B.
+PAIRED = {
+    # Control: identical players must score 50%.
+    "serial_vs_serial": ({}, {}),
+    "wu16_vs_serial": ({"parallel_mode": "wu_puct", **WORKERS16}, {}),
+    "seq16_vs_serial": ({"parallel_mode": "wu_puct", **SEQUENTIAL16}, {}),
+    "wu16_vs_seq16": ({"parallel_mode": "wu_puct", **WORKERS16},
+                      {"parallel_mode": "wu_puct", **SEQUENTIAL16}),
 }
 
 
@@ -118,7 +137,75 @@ def run(name, games):
     return totals
 
 
+def t95(n):
+    """Two-sided 95% t quantile for n - 1 degrees of freedom."""
+    table = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 10: 2.228,
+             20: 2.086, 30: 2.042, 60: 2.000, 120: 1.980}
+    df = n - 1
+    for limit in sorted(table):
+        if df <= limit:
+            return table[limit]
+    return 1.96
+
+
+def run_paired(name, pairs):
+    player1, player2 = PAIRED[name]
+    config = write_config(
+        {"search_limit": "think_time", "think_time_ms": PAIRED_THINK_MS,
+         **player1},
+        {"search_limit": "think_time", "think_time_ms": PAIRED_THINK_MS,
+         **player2})
+    out = pathlib.Path("results/paired")
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / f"{name}.csv"
+    (out / f"{name}.cfg").write_text("\n".join(config) + "\n")
+    start = time.time()
+    result = subprocess.run(["./build/pair_match", str(pairs), str(csv_path)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{name}: {result.stderr.strip()}")
+
+    points = {}
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            value = {"a": 1.0, "draw": 0.5, "b": 0.0}[row["winner"]]
+            points.setdefault(row["pair"], []).append(value)
+    scores = [sum(p) / len(p) for p in points.values()]
+    n = len(scores)
+    mean = sum(scores) / n
+    sd = math.sqrt(sum((s - mean) ** 2 for s in scores) / (n - 1))
+    half = t95(n) * sd / math.sqrt(n)
+    both_a = sum(s == 1.0 for s in scores)
+    both_b = sum(s == 0.0 for s in scores)
+    print(f"{name}: score {mean:.1%} +- {half:.1%} over {n} openings "
+          f"(A won both {both_a}, split {n - both_a - both_b}, "
+          f"B won both {both_b})  ({time.time() - start:.0f} s)", flush=True)
+    return n, mean, half, both_a, n - both_a - both_b, both_b
+
+
+def main_paired(args):
+    pairs = int(args[0]) if args and args[0].isdigit() else 150
+    names = [a for a in args if not a.isdigit()] or list(PAIRED)
+    summary = pathlib.Path("results/paired/summary.csv")
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not summary.exists()
+    with open(summary, "a", newline="") as f:
+        writer = csv.writer(f)
+        if new_file:
+            writer.writerow(["matchup", "openings", "score", "ci95",
+                             "a_won_both", "split", "b_won_both",
+                             "think_ms"])
+        for name in names:
+            n, mean, half, both_a, split, both_b = run_paired(name, pairs)
+            writer.writerow([name, n, f"{mean:.4f}", f"{half:.4f}", both_a,
+                             split, both_b, PAIRED_THINK_MS])
+            f.flush()
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--paired":
+        main_paired(sys.argv[2:])
+        return
     games = int(sys.argv[1]) if len(sys.argv) > 1 else GAMES
     names = sys.argv[2:] or list(MATCHUPS)
     summary = pathlib.Path("results/matches/summary.csv")

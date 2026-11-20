@@ -87,6 +87,11 @@ add_executable(search_stats tools/search_stats.cpp)
 target_compile_options(search_stats PRIVATE -Wall -Wextra)
 target_link_libraries(search_stats PRIVATE gomoku_nn "${TORCH_LIBRARIES}")
 
+# Paired games with swapped colors for win-rate experiments (LibTorch).
+add_executable(pair_match tools/pair_match.cpp)
+target_compile_options(pair_match PRIVATE -Wall -Wextra)
+target_link_libraries(pair_match PRIVATE gomoku_nn "${TORCH_LIBRARIES}")
+
 # Automated tests (enabled by default; disable with -DBUILD_TESTING=OFF)
 include(CTest)
 if (BUILD_TESTING)
