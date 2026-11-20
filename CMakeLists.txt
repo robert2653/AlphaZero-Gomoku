@@ -122,29 +122,7 @@ if (BUILD_TESTING)
   set_tests_properties(model_cuda PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-# OpenCL policy-value backend (hand-written kernels, no LibTorch). Built when
-# an OpenCL SDK is found; weights come from tools/export_opencl_weights.py.
-find_package(OpenCL)
-if (OpenCL_FOUND)
-  add_library(gomoku_opencl STATIC src/opencl_network.cpp)
-  target_include_directories(gomoku_opencl PUBLIC include)
-  target_compile_options(gomoku_opencl PRIVATE -Wall -Wextra)
-  target_link_libraries(gomoku_opencl PUBLIC gomoku_core OpenCL::OpenCL)
-
-  # Times the parallel MCTS with the LibTorch or the OpenCL backend.
-  add_executable(search_bench tools/search_bench.cpp)
-  target_compile_options(search_bench PRIVATE -Wall -Wextra)
-  target_link_libraries(search_bench PRIVATE gomoku_nn gomoku_opencl
-    "${TORCH_LIBRARIES}")
-
-  if (BUILD_TESTING)
-    add_executable(gomoku_opencl_tests tests/opencl_tests.cpp)
-    target_include_directories(gomoku_opencl_tests PRIVATE tests)
-    target_compile_options(gomoku_opencl_tests PRIVATE -Wall -Wextra)
-    target_link_libraries(gomoku_opencl_tests PRIVATE gomoku_opencl)
-    add_test(NAME opencl COMMAND gomoku_opencl_tests
-      "${PROJECT_SOURCE_DIR}/model/alpha-zero.bin"
-      "${PROJECT_SOURCE_DIR}/model/opencl-reference.bin"
-      "${PROJECT_SOURCE_DIR}/kernels/policy_value_network.cl")
-  endif()
-endif()
+# Times the parallel MCTS over thread counts and batch sizes (LibTorch).
+add_executable(search_bench tools/search_bench.cpp)
+target_compile_options(search_bench PRIVATE -Wall -Wextra)
+target_link_libraries(search_bench PRIVATE gomoku_nn "${TORCH_LIBRARIES}")

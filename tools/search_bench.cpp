@@ -1,9 +1,7 @@
-// Times the parallel MCTS with either backend over a grid of thread counts
-// and batch sizes, so LibTorch and OpenCL are measured the same way.
+// Times the parallel MCTS over a grid of thread counts and batch sizes.
 //
-// Usage: search_bench <torch|opencl|torch-cpu> [playouts] [repeats]
+// Usage: search_bench <torch|torch-cpu> [playouts] [repeats]
 //   torch:     uses model/alpha-zero.pt on CUDA
-//   opencl:    uses model/alpha-zero.bin and kernels/policy_value_network.cl
 //   torch-cpu: uses model/alpha-zero.pt on the CPU and compares where the
 //              cores go: LibTorch threads inside one inference, MCTS workers
 //              that each evaluate on their own core, mixes of the two, and
@@ -22,7 +20,6 @@
 #include <ATen/Parallel.h>
 
 #include "mcts.h"
-#include "opencl_network.h"
 #include "policy_value_network.h"
 
 namespace {
@@ -72,7 +69,8 @@ Result Run(PolicyValueEvaluator& evaluator, const SearchOptions& options,
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr << "Usage: search_bench <torch|opencl> [playouts] [repeats]\n";
+    std::cerr << "Usage: search_bench <torch|torch-cpu> [playouts] "
+                 "[repeats]\n";
     return 1;
   }
   const std::string backend = argv[1];
@@ -88,9 +86,6 @@ int main(int argc, char** argv) {
       at::set_num_threads(1);
       evaluator = std::make_unique<PolicyValueNetwork>(
           "model/alpha-zero.pt", PolicyValueNetwork::Device::kCpu);
-    } else if (backend == "opencl") {
-      evaluator = std::make_unique<OpenCLNetwork>(
-          "model/alpha-zero.bin", "kernels/policy_value_network.cl");
     } else {
       std::cerr << "Unknown backend '" << backend << "'\n";
       return 1;
